@@ -124,6 +124,10 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # Number of profile-cache owners pinning this block in GPU memory.
+    # Pinned blocks stay out of the free queue even when ref_cnt is 0.
+    pin_count: int = 0
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -147,6 +151,7 @@ class KVCacheBlock:
         return (
             f"KVCacheBlock(block_id={self.block_id}, "
             f"ref_cnt={self.ref_cnt}, "
+            f"pin_count={self.pin_count}, "
             f"_block_hash={self._block_hash!r}, "
             f"prev_free_block={prev_block_id}, "
             f"next_free_block={next_block_id})"

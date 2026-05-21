@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -167,6 +168,7 @@ class BlockPool:
 
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        self.profile_pinned_blocks: dict[str, set[int]] = defaultdict(set)
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -369,6 +371,66 @@ class BlockPool:
             )
         return True
 
+    def pin_cached_blocks(
+        self,
+        profile_id: str,
+        block_groups: Sequence[Sequence[KVCacheBlock]],
+    ) -> int:
+        """Pin cached prefix blocks for a warm profile.
+
+        Pinning keeps cached blocks resident in the GPU block pool after the
+        warmup request is freed. It does not create new KV data; it only
+        protects already cached full blocks from normal LRU eviction.
+        """
+        if not profile_id:
+            return 0
+
+        pinned_block_ids = self.profile_pinned_blocks[profile_id]
+        num_new_pins = 0
+        for blocks in block_groups:
+            for block in blocks:
+                if (
+                    block.is_null
+                    or block.block_hash is None
+                    or block.block_id in pinned_block_ids
+                ):
+                    continue
+                pinned_block_ids.add(block.block_id)
+                block.pin_count += 1
+                num_new_pins += 1
+
+                if block.ref_cnt == 0:
+                    # The block may have become an eviction candidate before
+                    # being pinned; remove it from the free queue if so.
+                    if (
+                        block.prev_free_block is not None
+                        and block.next_free_block is not None
+                    ):
+                        self.free_block_queue.remove(block)
+
+        return num_new_pins
+
+    def unpin_profile(self, profile_id: str) -> int:
+        """Release all GPU block pins associated with a profile."""
+        block_ids = self.profile_pinned_blocks.pop(profile_id, set())
+        num_unpinned = 0
+        appendable_blocks: list[KVCacheBlock] = []
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            if block.pin_count <= 0:
+                continue
+            block.pin_count -= 1
+            num_unpinned += 1
+            if block.ref_cnt == 0 and block.pin_count == 0 and not block.is_null:
+                appendable_blocks.append(block)
+        self.free_block_queue.append_n(appendable_blocks)
+        return num_unpinned
+
+    def clear_profile_pins(self) -> int:
+        """Release all profile pins and return the number of unpinned blocks."""
+        profile_ids = list(self.profile_pinned_blocks)
+        return sum(self.unpin_profile(profile_id) for profile_id in profile_ids)
+
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
         the block from the free queue. This is used when a block is hit by
@@ -379,8 +441,9 @@ class BlockPool:
         """
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
-            # candidate), so remove it.
-            if block.ref_cnt == 0 and not block.is_null:
+            # candidate), so remove it. Pinned blocks with ref_cnt=0 are
+            # already protected outside the free list.
+            if block.ref_cnt == 0 and block.pin_count == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
@@ -399,7 +462,11 @@ class BlockPool:
         for block in blocks_list:
             block.ref_cnt -= 1
         self.free_block_queue.append_n(
-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+            [
+                block
+                for block in blocks_list
+                if block.ref_cnt == 0 and block.pin_count == 0 and not block.is_null
+            ]
         )
 
     def evict_blocks(self, block_ids: set[int]) -> None:
@@ -430,6 +497,8 @@ class BlockPool:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
+        self.clear_profile_pins()
+
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(

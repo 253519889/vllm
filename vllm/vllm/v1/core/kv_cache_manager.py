@@ -372,6 +372,7 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self._maybe_pin_profile_cache(request)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -482,6 +483,27 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+            self._maybe_pin_profile_cache(request)
+
+    def _maybe_pin_profile_cache(self, request: Request) -> None:
+        """Keep warm profile prefix blocks resident in GPU KV cache."""
+        if not request.profile_cache_pin or not request.profile_cache_id:
+            return
+        blocks = self.coordinator.get_blocks(request.request_id)
+        num_pinned = self.block_pool.pin_cached_blocks(
+            request.profile_cache_id,
+            blocks,
+        )
+        if num_pinned:
+            logger.debug(
+                "Pinned %d KV cache blocks for profile %s",
+                num_pinned,
+                request.profile_cache_id,
+            )
+
+    def unpin_profile_cache(self, profile_id: str) -> int:
+        """Release GPU KV cache pins for a profile."""
+        return self.block_pool.unpin_profile(profile_id)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

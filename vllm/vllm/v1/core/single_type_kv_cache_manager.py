@@ -68,7 +68,10 @@ class SingleTypeKVCacheManager(ABC):
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
-        return sum(blk.ref_cnt == 0 and not blk.is_null for blk in blocks)
+        return sum(
+            blk.ref_cnt == 0 and blk.pin_count == 0 and not blk.is_null
+            for blk in blocks
+        )
 
     def get_num_blocks_to_allocate(
         self,

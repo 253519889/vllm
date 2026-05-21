@@ -62,6 +62,7 @@ def make_request(
     prompt_logprobs: int | None = None,
     cache_salt: str | None = None,
     lora_request: LoRARequest | None = None,
+    extra_args: dict | None = None,
 ):
     mm_features = []
     if mm_positions is not None:
@@ -79,7 +80,11 @@ def make_request(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=mm_features if mm_features else None,
-        sampling_params=SamplingParams(max_tokens=17, prompt_logprobs=prompt_logprobs),
+        sampling_params=SamplingParams(
+            max_tokens=17,
+            prompt_logprobs=prompt_logprobs,
+            extra_args=extra_args,
+        ),
         pooling_params=None,
         eos_token_id=100,
         lora_request=lora_request,
@@ -320,6 +325,73 @@ def test_prefill(hash_fn):
         free_block_queue.fake_free_list_tail.prev_free_block
         is free_block_queue.fake_free_list_head
     )
+
+
+@pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])
+def test_profile_cache_pin_keeps_warm_blocks_resident(hash_fn):
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config(block_size, 6),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+    )
+
+    profile_token_ids = [i for i in range(3) for _ in range(block_size)]
+    warmup_req = make_request(
+        "warmup",
+        profile_token_ids,
+        block_size,
+        hash_fn,
+        extra_args={"profile_cache_id": "profile-a", "profile_cache_pin": 1},
+    )
+
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(warmup_req)
+    assert not computed_blocks.blocks[0]
+    assert num_computed_tokens == 0
+
+    blocks = manager.allocate_slots(
+        warmup_req,
+        warmup_req.num_tokens,
+        len(computed_blocks.blocks[0]) * block_size,
+        computed_blocks,
+    )
+    assert blocks is not None
+    pinned_ids = set(blocks.get_block_ids()[0])
+    assert pinned_ids == {1, 2, 3}
+    assert manager.block_pool.profile_pinned_blocks["profile-a"] == pinned_ids
+    assert all(manager.block_pool.blocks[i].pin_count == 1 for i in pinned_ids)
+
+    manager.free(warmup_req)
+    free_ids = {
+        b.block_id for b in manager.block_pool.free_block_queue.get_all_free_blocks()
+    }
+    assert pinned_ids.isdisjoint(free_ids)
+    assert all(manager.block_pool.blocks[i].ref_cnt == 0 for i in pinned_ids)
+
+    hit_req = make_request(
+        "hit",
+        profile_token_ids + [99],
+        block_size,
+        hash_fn,
+    )
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(hit_req)
+    assert computed_blocks.get_block_ids() == ([1, 2, 3],)
+    assert num_computed_tokens == len(profile_token_ids)
+
+    num_new_tokens = hit_req.num_tokens - num_computed_tokens
+    blocks = manager.allocate_slots(
+        hit_req,
+        num_new_tokens,
+        len(computed_blocks.blocks[0]) * block_size,
+        computed_blocks,
+    )
+    assert blocks is not None and blocks.get_block_ids() == ([4],)
+    manager.free(hit_req)
+
+    assert manager.unpin_profile_cache("profile-a") == 3
+    assert all(manager.block_pool.blocks[i].pin_count == 0 for i in pinned_ids)
+    assert manager.block_pool.free_block_queue.num_free_blocks == 5
 
 
 def test_prefill_hybrid_model():

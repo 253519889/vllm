@@ -112,6 +112,10 @@ class Request:
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
 
+        extra_args = sampling_params.extra_args if sampling_params is not None else None
+        self.profile_cache_id = _get_profile_cache_id(extra_args)
+        self.profile_cache_pin = _get_profile_cache_pin(extra_args)
+
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -280,6 +284,28 @@ class Request:
         if self.request_id != other.request_id:
             return self.request_id < other.request_id
         return id(self) < id(other)
+
+
+def _get_profile_cache_id(extra_args: dict[str, Any] | None) -> str:
+    if not extra_args:
+        return ""
+    value = extra_args.get("profile_cache_id")
+    if value is None:
+        value = extra_args.get("profile_id")
+    return str(value) if value is not None else ""
+
+
+def _get_profile_cache_pin(extra_args: dict[str, Any] | None) -> bool:
+    if not extra_args:
+        return False
+    value = extra_args.get("profile_cache_pin", False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on", "pin"}
+    return False
 
 
 class RequestStatus(enum.IntEnum):
