@@ -37,6 +37,16 @@ ReqId = str
 logger = init_logger(__name__)
 
 
+def _config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
 @dataclass
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
@@ -152,6 +162,9 @@ class OffloadingConnectorScheduler:
         self.offloaded_block_size = spec.offloaded_block_size
         self.block_size_factor = self.offloaded_block_size // self.gpu_block_size
         self.manager: OffloadingManager = spec.get_manager()
+        self.profile_only = _config_bool(
+            spec.extra_config.get("profile_only", False)
+        )
 
         self._requests: dict[ReqId, Request] = {}
         # list of GPU block IDs per request
@@ -170,6 +183,8 @@ class OffloadingConnectorScheduler:
         # request ID -> set(block hashes being stored/load)
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
+        # request ID -> profile id for warmup requests that should stay in L2.
+        self._profile_store_reqs: dict[ReqId, str] = {}
 
     def _get_block_hashes(
         self,
@@ -262,6 +277,8 @@ class OffloadingConnectorScheduler:
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
         self._requests[request.request_id] = request
+        if request.profile_cache_store_l2 and request.profile_cache_id:
+            self._profile_store_reqs[request.request_id] = request.profile_cache_id
         # the block ids are updated in _get_reqs_to_store
         self._request_block_ids[request.request_id] = []
 
@@ -318,6 +335,9 @@ class OffloadingConnectorScheduler:
             block_ids = self._request_block_ids[req_id]
 
             req = self._requests[req_id]
+            if self.profile_only and not req.profile_cache_store_l2:
+                continue
+
             new_tokens = scheduler_output.num_scheduled_tokens[req_id]
             total_tokens = req.num_computed_tokens + new_tokens
             num_blocks = total_tokens // self.offloaded_block_size
@@ -330,9 +350,9 @@ class OffloadingConnectorScheduler:
             # NOTE: In async scheduling, placeholders may temporarily make
             # len(req.block_hashes) < num_blocks * self.block_size_factor.
 
-            new_block_hashes = self._get_block_hashes(
+            new_block_hashes = list(self._get_block_hashes(
                 req, start_idx=start_block_idx, end_idx=num_blocks
-            )
+            ))
             store_output = self.manager.prepare_store(new_block_hashes)
             if store_output is None:
                 logger.warning(
@@ -341,6 +361,14 @@ class OffloadingConnectorScheduler:
                 continue
 
             self._next_stored_block_idx[req_id] = num_blocks
+            profile_id = self._profile_store_reqs.get(req_id)
+            if profile_id:
+                self.manager.pin(profile_id, new_block_hashes)
+                logger.debug(
+                    "Pinned %s offloaded blocks for profile %s",
+                    len(new_block_hashes),
+                    profile_id,
+                )
 
             if not store_output.block_hashes_to_store:
                 continue
@@ -349,9 +377,9 @@ class OffloadingConnectorScheduler:
             block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
             self.manager.touch(block_hashes)
 
-            new_block_hashes = self._get_block_hashes(
+            new_block_hashes = list(self._get_block_hashes(
                 req, start_idx=start_block_idx, end_idx=num_blocks
-            )
+            ))
             dst_spec = store_output.store_spec
             src_block_ids: list[int] = []
             for idx, blk_hash in enumerate(new_block_hashes):
@@ -433,6 +461,7 @@ class OffloadingConnectorScheduler:
         self._requests.pop(req_id, None)
         self._request_block_ids.pop(req_id, None)
         self._next_stored_block_idx.pop(req_id, None)
+        self._profile_store_reqs.pop(req_id, None)
 
         request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None

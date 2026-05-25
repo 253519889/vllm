@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import hashlib
+import json
 from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -58,6 +62,16 @@ class CPUOffloadingSpec(OffloadingSpec):
         self._handlers: CpuGpuOffloadingHandlers | None = None
 
         self.eviction_policy: str = self.extra_config.get("eviction_policy", "lru")
+        self.persist_root = _optional_path(self.extra_config.get("persist_dir"))
+        self.persist_reset = _config_bool(self.extra_config.get("persist_reset", False))
+        self.persist_config_hash = (
+            self._persist_config_hash() if self.persist_root else ""
+        )
+        self.persist_rank_dir = (
+            self.persist_root / self._persist_namespace() / f"rank_{_rank_id()}"
+            if self.persist_root
+            else None
+        )
 
     def get_manager(self) -> OffloadingManager:
         if not self._manager:
@@ -72,11 +86,19 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             if self.eviction_policy == "lru":
                 self._manager = LRUOffloadingManager(
-                    backend=backend, enable_events=enable_events
+                    backend=backend,
+                    enable_events=enable_events,
+                    persist_path=self._persist_metadata_path(),
+                    reset_persisted=self.persist_reset,
+                    persist_config_hash=self.persist_config_hash,
                 )
             elif self.eviction_policy == "arc":
                 self._manager = ARCOffloadingManager(
-                    backend=backend, enable_events=enable_events
+                    backend=backend,
+                    enable_events=enable_events,
+                    persist_path=self._persist_metadata_path(),
+                    reset_persisted=self.persist_reset,
+                    persist_config_hash=self.persist_config_hash,
                 )
             else:
                 raise ValueError(
@@ -102,8 +124,66 @@ class CPUOffloadingSpec(OffloadingSpec):
                 cpu_block_size=self.offloaded_block_size,
                 num_cpu_blocks=self.num_blocks,
                 gpu_caches=kv_caches,
+                persist_path=self._persist_tensor_path(),
+                reset_persisted=self.persist_reset,
+                persist_config_hash=self.persist_config_hash,
             )
 
         assert self._handlers is not None
         yield GPULoadStoreSpec, CPULoadStoreSpec, self._handlers.gpu_to_cpu_handler
         yield CPULoadStoreSpec, GPULoadStoreSpec, self._handlers.cpu_to_gpu_handler
+
+    def _persist_namespace(self) -> str:
+        namespace = self.extra_config.get("persist_namespace")
+        if namespace:
+            return str(namespace)
+        return f"model_{self.persist_config_hash[:16]}"
+
+    def _persist_config_hash(self) -> str:
+        model_config = getattr(self.vllm_config, "model_config", None)
+        model_name = str(getattr(model_config, "model", "model"))
+        payload = {
+            "model": model_name,
+            "gpu_block_size": self.gpu_block_size,
+            "offloaded_block_size": self.offloaded_block_size,
+            "num_blocks": self.num_blocks,
+            "world_size": self.vllm_config.parallel_config.world_size,
+            "kv_cache_tensors": len(self.kv_cache_config.kv_cache_tensors)
+            if self.kv_cache_config
+            else 0,
+        }
+        return hashlib.sha1(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _persist_metadata_path(self) -> str | None:
+        if self.persist_rank_dir is None:
+            return None
+        return str(self.persist_rank_dir / "blocks.json")
+
+    def _persist_tensor_path(self) -> str | None:
+        if self.persist_rank_dir is None:
+            return None
+        return str(self.persist_rank_dir / "tensors")
+
+
+def _optional_path(value: Any) -> Path | None:
+    if value is None or value == "":
+        return None
+    return Path(str(value))
+
+
+def _rank_id() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank())
+    return 0
+
+
+def _config_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return False

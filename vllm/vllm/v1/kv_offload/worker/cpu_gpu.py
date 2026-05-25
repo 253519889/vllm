@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 from collections import deque
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -186,6 +189,9 @@ class CpuGpuOffloadingHandlers:
         num_cpu_blocks: int,
         gpu_caches: dict[str, torch.Tensor],
         attn_backends: dict[str, type[AttentionBackend]],
+        persist_path: str | None = None,
+        reset_persisted: bool = False,
+        persist_config_hash: str = "",
     ):
         assert gpu_caches
         assert cpu_block_size % gpu_block_size == 0
@@ -245,23 +251,63 @@ class CpuGpuOffloadingHandlers:
 
         # allocate cpu tensors
         pin_memory = is_pin_memory_available()
+        persist_root = Path(persist_path) if persist_path else None
+        if persist_root:
+            persist_root.mkdir(parents=True, exist_ok=True)
+            pin_memory = False
         logger.info("Allocating %d CPU tensors...", len(parsed_gpu_tensors))
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
-        for gpu_tensor, split_k_and_v in parsed_gpu_tensors:
+        tensor_manifest: list[dict[str, Any]] = []
+        cpu_specs: list[tuple[torch.Tensor, bool, list[int]]] = []
+        for tensor_index, (gpu_tensor, split_k_and_v) in enumerate(parsed_gpu_tensors):
             cpu_shape = list(gpu_tensor.shape)
             cpu_shape[1 if split_k_and_v else 0] = num_cpu_kernel_blocks
+            cpu_specs.append((gpu_tensor, split_k_and_v, cpu_shape))
+            if persist_root:
+                tensor_manifest.append(
+                    {
+                        "index": tensor_index,
+                        "file": f"tensor_{tensor_index}.bin",
+                        "shape": cpu_shape,
+                        "dtype": str(gpu_tensor.dtype),
+                    }
+                )
 
+        persist_manifest = {
+            "version": 1,
+            "config_hash": persist_config_hash,
+            "num_cpu_blocks": num_cpu_blocks,
+            "gpu_block_size": gpu_block_size,
+            "cpu_block_size": cpu_block_size,
+            "tensors": tensor_manifest,
+        }
+        if persist_root and not _manifest_matches(
+            persist_root / "tensors.json",
+            persist_manifest,
+        ):
+            reset_persisted = True
+
+        for tensor_index, (gpu_tensor, split_k_and_v, cpu_shape) in enumerate(
+            cpu_specs
+        ):
             logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
-            cpu_tensor = torch.zeros(
-                cpu_shape,
+            cpu_tensor = _allocate_cpu_tensor(
+                shape=cpu_shape,
                 dtype=gpu_tensor.dtype,
-                device="cpu",
                 pin_memory=pin_memory,
+                persist_root=persist_root,
+                tensor_index=tensor_index,
+                reset_persisted=reset_persisted,
             )
 
             gpu_tensors.extend(gpu_tensor.unbind(0) if split_k_and_v else [gpu_tensor])
             cpu_tensors.extend(cpu_tensor.unbind(0) if split_k_and_v else [cpu_tensor])
+        if persist_root:
+            (persist_root / "tensors.json").write_text(
+                json.dumps(persist_manifest, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
         self.gpu_to_cpu_handler = SingleDirectionOffloadingHandler(
             src_tensors=gpu_tensors,
@@ -276,3 +322,53 @@ class CpuGpuOffloadingHandlers:
             src_block_size_factor=cpu_block_size_factor,
             dst_block_size_factor=gpu_block_size_factor,
         )
+
+
+def _allocate_cpu_tensor(
+    shape: list[int],
+    dtype: torch.dtype,
+    pin_memory: bool,
+    persist_root: Path | None,
+    tensor_index: int,
+    reset_persisted: bool,
+) -> torch.Tensor:
+    if persist_root is None:
+        return torch.zeros(
+            shape,
+            dtype=dtype,
+            device="cpu",
+            pin_memory=pin_memory,
+        )
+
+    tensor_path = persist_root / f"tensor_{tensor_index}.bin"
+    numel = int(np.prod(shape))
+    element_size = torch.empty((), dtype=dtype).element_size()
+    expected_bytes = numel * element_size
+    needs_init = (
+        reset_persisted
+        or not tensor_path.exists()
+        or tensor_path.stat().st_size != expected_bytes
+    )
+    if needs_init:
+        with tensor_path.open("wb") as f:
+            f.truncate(expected_bytes)
+
+    tensor = torch.from_file(
+        str(tensor_path),
+        shared=True,
+        size=numel,
+        dtype=dtype,
+    ).reshape(shape)
+    if needs_init:
+        tensor.zero_()
+    return tensor
+
+
+def _manifest_matches(path: Path, expected: dict[str, Any]) -> bool:
+    if not path.exists():
+        return False
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return actual == expected

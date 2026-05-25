@@ -115,6 +115,10 @@ class Request:
         extra_args = sampling_params.extra_args if sampling_params is not None else None
         self.profile_cache_id = _get_profile_cache_id(extra_args)
         self.profile_cache_pin = _get_profile_cache_pin(extra_args)
+        self.profile_cache_store_l2 = _get_profile_cache_store_l2(extra_args)
+        self.profile_cache_reusable_tokens = _get_profile_cache_reusable_tokens(
+            extra_args
+        )
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -299,12 +303,33 @@ def _get_profile_cache_pin(extra_args: dict[str, Any] | None) -> bool:
     if not extra_args:
         return False
     value = extra_args.get("profile_cache_pin", False)
+    return _coerce_bool(value)
+
+
+def _get_profile_cache_store_l2(extra_args: dict[str, Any] | None) -> bool:
+    if not extra_args:
+        return False
+    value = extra_args.get("profile_cache_store_l2", False)
+    return _coerce_bool(value)
+
+
+def _get_profile_cache_reusable_tokens(extra_args: dict[str, Any] | None) -> int:
+    if not extra_args:
+        return 0
+    value = extra_args.get("profile_cache_reusable_tokens", 0)
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _coerce_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
         return value != 0
     if isinstance(value, str):
-        return value.lower() in {"1", "true", "yes", "y", "on", "pin"}
+        return value.lower() in {"1", "true", "yes", "y", "on", "pin", "store"}
     return False
 
 

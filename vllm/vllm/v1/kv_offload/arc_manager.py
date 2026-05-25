@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections import OrderedDict
+import json
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Iterable
+from pathlib import Path
 
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.kv_offload.abstract import (
@@ -52,7 +54,14 @@ class ARCOffloadingManager(OffloadingManager):
         - B2 hit: Frequent access patterns matter more → decrease T1.
     """
 
-    def __init__(self, backend: Backend, enable_events: bool = False):
+    def __init__(
+        self,
+        backend: Backend,
+        enable_events: bool = False,
+        persist_path: str | None = None,
+        reset_persisted: bool = False,
+        persist_config_hash: str = "",
+    ):
         self.backend: Backend = backend
         self.target_t1_size: float = 0.0
         self.t1: OrderedDict[BlockHash, BlockStatus] = OrderedDict()
@@ -62,6 +71,13 @@ class ARCOffloadingManager(OffloadingManager):
         self.b2: OrderedDict[BlockHash, None] = OrderedDict()
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
         self.cache_capacity: int = self.backend.get_num_free_blocks()
+        self.owner_pins: defaultdict[str, set[BlockHash]] = defaultdict(set)
+        self.block_pin_count: Counter[BlockHash] = Counter()
+        self.persist_path = Path(persist_path) if persist_path else None
+        self.persist_config_hash = persist_config_hash
+        if reset_persisted and self.persist_path and self.persist_path.exists():
+            self.persist_path.unlink()
+        self._restore_state()
 
     def lookup(self, block_hashes: Iterable[BlockHash]) -> int | None:
         hit_count = 0
@@ -119,6 +135,37 @@ class ARCOffloadingManager(OffloadingManager):
 
             block.ref_cnt -= 1
 
+    def pin(self, owner_id: str, block_hashes: Iterable[BlockHash]):
+        if not owner_id:
+            return
+        owner_blocks = self.owner_pins[owner_id]
+        for block_hash in block_hashes:
+            block = self.t1.get(block_hash) or self.t2.get(block_hash)
+            if block is None or block_hash in owner_blocks:
+                continue
+            owner_blocks.add(block_hash)
+            self.block_pin_count[block_hash] += 1
+        self._persist_state()
+
+    def unpin(self, owner_id: str):
+        for block_hash in self.owner_pins.pop(owner_id, set()):
+            count = self.block_pin_count.get(block_hash, 0)
+            if count <= 1:
+                self.block_pin_count.pop(block_hash, None)
+            else:
+                self.block_pin_count[block_hash] = count - 1
+        self._persist_state()
+
+    def _is_pinned(self, block_hash: BlockHash) -> bool:
+        return self.block_pin_count.get(block_hash, 0) > 0
+
+    def _drop_pin_state(self, block_hash: BlockHash):
+        self.block_pin_count.pop(block_hash, None)
+        for owner_id, owner_blocks in list(self.owner_pins.items()):
+            owner_blocks.discard(block_hash)
+            if not owner_blocks:
+                self.owner_pins.pop(owner_id, None)
+
     def prepare_store(
         self, block_hashes: Iterable[BlockHash]
     ) -> PrepareStoreOutput | None:
@@ -144,7 +191,7 @@ class ARCOffloadingManager(OffloadingManager):
             if len(self.t1) >= int(self.target_t1_size):
                 # try to evict the least recently used (oldest) block from T1
                 for block_hash, block in self.t1.items():
-                    if block.ref_cnt == 0:
+                    if block.ref_cnt == 0 and not self._is_pinned(block_hash):
                         block_to_evict = (block_hash, block)
                         eviction_t = self.t1
                         eviction_b = self.b1
@@ -152,7 +199,7 @@ class ARCOffloadingManager(OffloadingManager):
             if not block_to_evict:
                 # try to evict the least recently used (oldest) block from T2
                 for block_hash, block in self.t2.items():
-                    if block.ref_cnt == 0:
+                    if block.ref_cnt == 0 and not self._is_pinned(block_hash):
                         block_to_evict = (block_hash, block)
                         eviction_t = self.t2
                         eviction_b = self.b2
@@ -220,6 +267,7 @@ class ARCOffloadingManager(OffloadingManager):
 
                 if block is not None and not block.is_ready:
                     self.backend.free(block)
+                    self._drop_pin_state(block_hash)
 
         if stored_block_hashes and self.events is not None:
             self.events.append(
@@ -230,8 +278,106 @@ class ARCOffloadingManager(OffloadingManager):
                     removed=False,
                 )
             )
+        self._persist_state()
 
     def take_events(self) -> Iterable[OffloadingEvent]:
         if self.events is not None:
             yield from self.events
             self.events.clear()
+
+    def _restore_state(self):
+        if not self.persist_path or not self.persist_path.exists():
+            return
+        try:
+            payload = json.loads(self.persist_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        records = payload.get("blocks", [])
+        if not isinstance(records, list):
+            return
+        if (
+            self.persist_config_hash
+            and payload.get("config_hash") != self.persist_config_hash
+        ):
+            return
+        try:
+            persisted_block_size = int(payload.get("block_size", -1))
+            persisted_num_blocks = int(payload.get("num_blocks", -1))
+        except (TypeError, ValueError):
+            return
+        if persisted_block_size != self.backend.block_size:
+            return
+        if persisted_num_blocks != getattr(self.backend, "num_blocks", -2):
+            return
+        block_ids = [
+            int(record["block_id"])
+            for record in records
+            if isinstance(record, dict) and "block_id" in record
+        ]
+        restore_blocks = getattr(self.backend, "restore_blocks", None)
+        if not callable(restore_blocks):
+            return
+        statuses = restore_blocks(block_ids)
+        for record, status in zip(records, statuses):
+            block_hash_hex = record.get("block_hash") if isinstance(record, dict) else ""
+            if not isinstance(block_hash_hex, str):
+                continue
+            try:
+                block_hash = BlockHash(bytes.fromhex(block_hash_hex))
+            except ValueError:
+                continue
+            self.t2[block_hash] = status
+
+        owner_pins = payload.get("owner_pins", {})
+        if isinstance(owner_pins, dict):
+            for owner_id, block_hashes in owner_pins.items():
+                if not isinstance(owner_id, str) or not isinstance(block_hashes, list):
+                    continue
+                for block_hash_hex in block_hashes:
+                    if not isinstance(block_hash_hex, str):
+                        continue
+                    try:
+                        block_hash = BlockHash(bytes.fromhex(block_hash_hex))
+                    except ValueError:
+                        continue
+                    if block_hash not in self.t1 and block_hash not in self.t2:
+                        continue
+                    self.owner_pins[owner_id].add(block_hash)
+                    self.block_pin_count[block_hash] += 1
+
+    def _persist_state(self):
+        if not self.persist_path:
+            return
+        self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+        ready_blocks = [
+            (block_hash, block)
+            for block_hash, block in [*self.t1.items(), *self.t2.items()]
+            if block.is_ready and hasattr(block, "block_id")
+        ]
+        ready_hashes = {block_hash for block_hash, _ in ready_blocks}
+        owner_pins = {
+            owner_id: sorted(
+                block_hash.hex()
+                for block_hash in block_hashes
+                if block_hash in ready_hashes
+            )
+            for owner_id, block_hashes in self.owner_pins.items()
+        }
+        payload = {
+            "version": 1,
+            "policy": "arc",
+            "config_hash": self.persist_config_hash,
+            "block_size": self.backend.block_size,
+            "num_blocks": getattr(self.backend, "num_blocks", None),
+            "blocks": [
+                {
+                    "block_hash": block_hash.hex(),
+                    "block_id": int(getattr(block, "block_id")),
+                }
+                for block_hash, block in ready_blocks
+            ],
+            "owner_pins": owner_pins,
+        }
+        tmp_path = self.persist_path.with_suffix(self.persist_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        tmp_path.replace(self.persist_path)

@@ -52,6 +52,31 @@ class CPUBackend(Backend):
 
         return blocks
 
+    def restore_blocks(self, block_ids: list[int]) -> list[BlockStatus]:
+        """Restore block statuses for block IDs backed by persisted tensors."""
+        if any(block_id < 0 or block_id >= self.num_blocks for block_id in block_ids):
+            raise ValueError(
+                f"Persisted CPU block ids must be in [0, {self.num_blocks})"
+            )
+        restored = set(block_ids)
+        if restored:
+            self.num_allocated_blocks = max(
+                self.num_allocated_blocks,
+                max(restored) + 1,
+            )
+        self.allocated_blocks_free_list = [
+            block_id
+            for block_id in range(self.num_allocated_blocks)
+            if block_id not in restored
+        ]
+
+        blocks: list[BlockStatus] = []
+        for block_id in block_ids:
+            block = CPUBlockStatus(block_id)
+            block.ref_cnt = 0
+            blocks.append(block)
+        return blocks
+
     def free(self, block: BlockStatus):
         assert isinstance(block, CPUBlockStatus)
         self.allocated_blocks_free_list.append(block.block_id)

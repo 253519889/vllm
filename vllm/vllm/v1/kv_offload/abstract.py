@@ -120,6 +120,22 @@ class OffloadingManager(ABC):
         """
         return
 
+    def pin(self, owner_id: str, block_hashes: Iterable[BlockHash]):
+        """
+        Protect offloaded blocks from eviction for a logical owner.
+
+        Managers that do not support pinning may treat this as a no-op. The
+        scheduler uses this for profile prefix cache warmup so CPU-resident
+        profile blocks survive ordinary LRU/ARC churn.
+        """
+        return
+
+    def unpin(self, owner_id: str):
+        """
+        Release blocks previously pinned for a logical owner.
+        """
+        return
+
     @abstractmethod
     def prepare_store(
         self, block_hashes: Iterable[BlockHash]
