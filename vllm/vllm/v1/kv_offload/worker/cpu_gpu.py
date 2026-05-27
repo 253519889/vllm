@@ -101,8 +101,11 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         # job_id -> event
         self._transfer_events: dict[int, torch.Event] = {}
-        # queue of transfers (job_id, stream, event)
-        self._transfers: deque[tuple[int, torch.cuda.Stream, torch.Event]] = deque()
+        self._transfer_start_events: dict[int, torch.Event] = {}
+        # queue of transfers (job_id, stream, start_event, end_event)
+        self._transfers: deque[
+            tuple[int, torch.cuda.Stream, torch.Event, torch.Event]
+        ] = deque()
         # list of CUDA streams available for re-use
         self._stream_pool: list[torch.cuda.Stream] = []
         # list of CUDA events available for re-use
@@ -135,16 +138,20 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
 
         stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
-        event = self._event_pool.pop() if self._event_pool else torch.Event()
+        start_event = torch.Event(enable_timing=True)
+        event = self._event_pool.pop() if self._event_pool else torch.Event(
+            enable_timing=True
+        )
 
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
             stream.wait_stream(torch.cuda.current_stream())
         if self._transfers:
-            _, _, last_event = self._transfers[-1]
+            _, _, _, last_event = self._transfers[-1]
             # assure job will start only after the previous one completes
             stream.wait_event(last_event)
         with torch.cuda.stream(stream):
+            start_event.record(stream)
             for src_tensor, dst_tensor, block_size_in_bytes in zip(
                 self.src_tensors,
                 self.dst_tensors,
@@ -158,19 +165,22 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 )
             event.record(stream)
 
+        self._transfer_start_events[job_id] = start_event
         self._transfer_events[job_id] = event
-        self._transfers.append((job_id, stream, event))
+        self._transfers.append((job_id, stream, start_event, event))
 
         # success
         return True
 
     def get_finished(self) -> list[TransferResult]:
         results: list[TransferResult] = []
-        while self._transfers and self._transfers[0][2].query():
-            job_id, stream, event = self._transfers.popleft()
-            results.append((job_id, True))
+        while self._transfers and self._transfers[0][3].query():
+            job_id, stream, start_event, event = self._transfers.popleft()
+            transfer_ms = start_event.elapsed_time(event)
+            results.append((job_id, True, transfer_ms))
             self._stream_pool.append(stream)
             self._event_pool.append(event)
+            del self._transfer_start_events[job_id]
             del self._transfer_events[job_id]
         return results
 
@@ -359,8 +369,6 @@ def _allocate_cpu_tensor(
         size=numel,
         dtype=dtype,
     ).reshape(shape)
-    if needs_init:
-        tensor.zero_()
     return tensor
 
 

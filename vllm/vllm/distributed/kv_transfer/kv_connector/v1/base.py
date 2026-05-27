@@ -375,6 +375,15 @@ class KVConnectorBase_V1(ABC):
         """
         return set()
 
+    def get_kv_transfer_metrics(self) -> dict[str, dict[str, Any]]:
+        """
+        Return request-level KV transfer metrics collected on the worker.
+
+        The returned dictionary is keyed by request ID and should contain only
+        JSON-serializable values.
+        """
+        return {}
+
     def shutdown(self):
         """
         Shutdown the connector. This is called when the worker process

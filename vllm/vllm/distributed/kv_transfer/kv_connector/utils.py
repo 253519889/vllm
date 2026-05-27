@@ -82,6 +82,7 @@ class KVOutputAggregator:
         finished_recving = set[str]()
         aggregated_kv_connector_stats = None
         combined_kv_cache_events = None
+        kv_transfer_metrics: dict[str, dict[str, Any]] = {}
         invalid_block_ids = set[int]()
         for model_runner_output in outputs:
             assert model_runner_output is not None
@@ -137,6 +138,19 @@ class KVOutputAggregator:
                 combined_kv_cache_events.increment_workers(1)
 
             invalid_block_ids |= kv_output.invalid_block_ids
+            for req_id, metrics in kv_output.kv_transfer_metrics.items():
+                existing = kv_transfer_metrics.setdefault(req_id, {})
+                previous_transfer_ms = float(
+                    existing.get("cpu_to_gpu_transfer_ms", 0.0)
+                )
+                worker_transfer_ms = float(
+                    metrics.get("cpu_to_gpu_transfer_ms", 0.0)
+                )
+                existing.update(metrics)
+                existing["cpu_to_gpu_transfer_ms"] = max(
+                    previous_transfer_ms,
+                    worker_transfer_ms,
+                )
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
@@ -145,6 +159,7 @@ class KVOutputAggregator:
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
+            kv_transfer_metrics=kv_transfer_metrics,
             kv_connector_stats=aggregated_kv_connector_stats or None,
             kv_cache_events=combined_kv_cache_events or None,
             invalid_block_ids=invalid_block_ids,

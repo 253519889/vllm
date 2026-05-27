@@ -1684,6 +1684,9 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+        if request.kv_transfer_metrics:
+            kv_xfer_params = dict(kv_xfer_params or {})
+            kv_xfer_params["l2_cache"] = dict(request.kv_transfer_metrics)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)
@@ -1940,6 +1943,11 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        for req_id, metrics in kv_connector_output.kv_transfer_metrics.items():
+            request = self.requests.get(req_id)
+            if request is not None:
+                request.kv_transfer_metrics.update(metrics)
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():

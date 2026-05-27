@@ -451,6 +451,11 @@ class OpenAIServingChat(OpenAIServing):
 
         assert len(generators) == 1
         (result_generator,) = generators
+        result_generator = self._log_token_timing_outputs(
+            result_generator,
+            request_id=request_id,
+            is_streaming=request.stream,
+        )
 
         # Streaming response
         tokenizer = self.renderer.tokenizer
@@ -480,6 +485,90 @@ class OpenAIServingChat(OpenAIServing):
             return self._convert_generation_error_to_response(e)
         except ValueError as e:
             return self.create_error_response(e)
+
+    async def _log_token_timing_outputs(
+        self,
+        result_generator: AsyncIterator[RequestOutput],
+        request_id: str,
+        is_streaming: bool,
+    ) -> AsyncGenerator[RequestOutput, None]:
+        started = time.perf_counter()
+        first_output_at: float | None = None
+        final_res: RequestOutput | None = None
+        observed_output_tokens = 0
+
+        try:
+            async for res in result_generator:
+                new_tokens = self._count_observed_output_tokens(res)
+                if new_tokens > 0 and first_output_at is None:
+                    first_output_at = time.perf_counter()
+                if is_streaming:
+                    observed_output_tokens += new_tokens
+                else:
+                    observed_output_tokens = max(observed_output_tokens, new_tokens)
+                final_res = res
+                yield res
+        finally:
+            if final_res is not None:
+                self._log_token_timing(
+                    request_id=request_id,
+                    final_res=final_res,
+                    started=started,
+                    first_output_at=first_output_at,
+                    observed_output_tokens=observed_output_tokens,
+                )
+
+    def _count_observed_output_tokens(self, res: RequestOutput) -> int:
+        return sum(len(output.token_ids) for output in res.outputs)
+
+    def _log_token_timing(
+        self,
+        request_id: str,
+        final_res: RequestOutput,
+        started: float,
+        first_output_at: float | None,
+        observed_output_tokens: int,
+    ) -> None:
+        metrics = final_res.metrics
+        output_tokens = observed_output_tokens
+        if metrics is not None and metrics.num_generation_tokens > 0:
+            output_tokens = metrics.num_generation_tokens
+
+        source = "serving"
+        ttft_ms = 0.0
+        avg_output_token_ms = 0.0
+        if metrics is not None and metrics.first_token_latency > 0:
+            source = "engine"
+            ttft_ms = metrics.first_token_latency * 1000
+            decode_s = max(0.0, metrics.last_token_ts - metrics.first_token_ts)
+            if output_tokens > 1:
+                avg_output_token_ms = decode_s * 1000 / (output_tokens - 1)
+        elif first_output_at is not None:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            ttft_ms = (first_output_at - started) * 1000
+            if output_tokens > 1:
+                avg_output_token_ms = max(0.0, elapsed_ms - ttft_ms) / (
+                    output_tokens - 1
+                )
+
+        l2_cache = {}
+        if final_res.kv_transfer_params:
+            l2_cache = final_res.kv_transfer_params.get("l2_cache", {}) or {}
+        logger.info(
+            "VLLM_TOKEN_TIMING request_id=%s ttft_ms=%.3f "
+            "avg_output_token_ms=%.3f output_tokens=%d cached_tokens=%s "
+            "l2_hit=%s l2_hit_tokens=%s cpu_to_gpu_transfer_ms=%.3f "
+            "source=%s",
+            request_id,
+            ttft_ms,
+            avg_output_token_ms,
+            output_tokens,
+            final_res.num_cached_tokens,
+            bool(l2_cache.get("l2_hit", False)),
+            l2_cache.get("l2_hit_tokens", 0),
+            float(l2_cache.get("cpu_to_gpu_transfer_ms", 0.0)),
+            source,
+        )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
         if request.add_generation_prompt:
@@ -645,6 +734,7 @@ class OpenAIServingChat(OpenAIServing):
         finish_reason_sent = [False] * num_choices
         num_prompt_tokens = 0
         num_cached_tokens = None
+        kv_transfer_params: dict[str, Any] | None = None
         if self.use_harmony:
             harmony_parsers = [
                 get_streamable_parser_for_assistant() for _ in range(num_choices)
@@ -733,6 +823,8 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                if res.kv_transfer_params:
+                    kv_transfer_params = res.kv_transfer_params
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1339,6 +1431,7 @@ class OpenAIServingChat(OpenAIServing):
                     choices=[],
                     model=model_name,
                     usage=final_usage,
+                    kv_transfer_params=kv_transfer_params,
                 )
                 final_usage_data = final_usage_chunk.model_dump_json(
                     exclude_unset=True, exclude_none=True

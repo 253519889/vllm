@@ -3,7 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, NamedTuple, TypeAlias
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias
 
 import numpy as np
 import torch
@@ -117,6 +117,7 @@ class KVConnectorOutput:
     # [req_ids]
     finished_sending: set[str] | None = None
     finished_recving: set[str] | None = None
+    kv_transfer_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
     kv_connector_stats: KVConnectorStats | None = None
     kv_cache_events: KVConnectorKVEvents | None = None
     # IDs of externally computed KV blocks that failed to load.
@@ -133,6 +134,7 @@ class KVConnectorOutput:
         return (
             not self.finished_sending
             and not self.finished_recving
+            and not self.kv_transfer_metrics
             and not self.kv_connector_stats
             and not self.kv_cache_events
             and not self.invalid_block_ids

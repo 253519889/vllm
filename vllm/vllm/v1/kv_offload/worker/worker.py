@@ -9,8 +9,8 @@ from vllm.v1.kv_offload.abstract import LoadStoreSpec
 TransferSpec = tuple[LoadStoreSpec, LoadStoreSpec]
 # transfers are forwarded to workers by (src_medium, dst_medium)
 TransferType = tuple[str, str]
-# transfer result (job_id, success)
-TransferResult = tuple[int, bool]
+# transfer result (job_id, success) with an optional transfer duration in ms
+TransferResult = tuple[int, bool] | tuple[int, bool, float]
 
 logger = init_logger(__name__)
 

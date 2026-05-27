@@ -51,6 +51,7 @@ def _config_bool(value: Any) -> bool:
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
+    reqs_to_load_metrics: dict[ReqId, dict[str, Any]]
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -115,6 +116,10 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def get_kv_transfer_metrics(self) -> dict[str, dict[str, Any]]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_kv_transfer_metrics()
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -171,6 +176,7 @@ class OffloadingConnectorScheduler:
         self._request_block_ids: dict[ReqId, list[int]] = {}
         # requests to load for the current scheduler step
         self._reqs_to_load: dict[ReqId, TransferSpec] = {}
+        self._reqs_to_load_metrics: dict[ReqId, dict[str, Any]] = {}
         # request blocks are stored in order
         # index of next block (of size offloaded_block_size) to offload
         self._next_stored_block_idx: dict[ReqId, int] = {}
@@ -314,6 +320,11 @@ class OffloadingConnectorScheduler:
         )
 
         self._reqs_to_load[request.request_id] = (src_spec, dst_spec)
+        self._reqs_to_load_metrics[request.request_id] = {
+            "l2_hit": True,
+            "l2_hit_tokens": num_external_tokens,
+            "l2_hit_blocks": num_external_tokens // self.offloaded_block_size,
+        }
         req_blocks_being_loaded = self._reqs_being_loaded[request.request_id]
         req_blocks_being_loaded.update(block_hashes)
         self._next_stored_block_idx[request.request_id] = num_blocks
@@ -409,8 +420,10 @@ class OffloadingConnectorScheduler:
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            reqs_to_load_metrics=self._reqs_to_load_metrics,
         )
         self._reqs_to_load = {}
+        self._reqs_to_load_metrics = {}
 
         # NOTE (orozery): we should move this logic to update_connector_output
         # once KVConnectorOutput allows us to report completed transfers
@@ -504,6 +517,8 @@ class OffloadingConnectorWorker:
         self._store_jobs = defaultdict[ReqId, set[int]](set)
         # list of store jobs pending submission (job_id, transfer_spec)
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
+        self._load_metrics_by_job: dict[int, dict[str, Any]] = {}
+        self._finished_load_metrics: dict[ReqId, dict[str, Any]] = {}
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
 
@@ -563,6 +578,9 @@ class OffloadingConnectorWorker:
             self._jobs[job_id] = (req_id, False)
             assert req_id not in self._load_job
             self._load_job[req_id] = job_id
+            self._load_metrics_by_job[job_id] = dict(
+                metadata.reqs_to_load_metrics.get(req_id, {})
+            )
             success = self.worker.transfer_async(job_id, transfer_spec)
             assert success
 
@@ -588,7 +606,9 @@ class OffloadingConnectorWorker:
         """
         finished_sending = set()
         finished_recving = set()
-        for job_id, success in self.worker.get_finished():
+        for transfer_result in self.worker.get_finished():
+            job_id, success = transfer_result[:2]
+            transfer_ms = transfer_result[2] if len(transfer_result) > 2 else 0.0
             # we currently do not support job failures
             assert success
             req_id, store = self._jobs.pop(job_id)
@@ -607,6 +627,10 @@ class OffloadingConnectorWorker:
                 assert job_id == req_job
                 del self._load_job[req_id]
                 finished_recving.add(req_id)
+                metrics = self._load_metrics_by_job.pop(job_id, {})
+                metrics["l2_hit"] = True
+                metrics["cpu_to_gpu_transfer_ms"] = float(transfer_ms)
+                self._finished_load_metrics[req_id] = metrics
 
         for req_id in finished_req_ids:
             pending_req_jobs = self._store_jobs.get(req_id)
@@ -617,3 +641,8 @@ class OffloadingConnectorWorker:
                 del self._store_jobs[req_id]
 
         return finished_sending, finished_recving
+
+    def get_kv_transfer_metrics(self) -> dict[str, dict[str, Any]]:
+        metrics = self._finished_load_metrics
+        self._finished_load_metrics = {}
+        return metrics
