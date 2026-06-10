@@ -42,6 +42,7 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
 )
+from vllm.scorephrase import build_config_c_fsm_state, build_scorephrase_score_space
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
@@ -354,6 +355,22 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "numeric values, used by custom extensions."
         ),
     )
+    scorephrase: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "ScorePhrase request-local scoring state. When provided, vLLM "
+            "server builds the Score-729 regex from allowed_levels and applies "
+            "it through structured_outputs.regex."
+        ),
+    )
+    sand_fsm: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "SandPlay Config C field-level FSM state. The server validates "
+            "request-local JSON path generation modes and stores them for "
+            "online field jump and proposer stages."
+        ),
+    )
 
     # --8<-- [end:chat-completion-extra-params]
 
@@ -449,7 +466,32 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        scorephrase_state = build_scorephrase_score_space(self.scorephrase)
+        if scorephrase_state is not None:
+            scorephrase_regex = scorephrase_state["score_regex"]
+            if self.structured_outputs is None:
+                self.structured_outputs = StructuredOutputsParams(
+                    regex=scorephrase_regex
+                )
+            elif self.structured_outputs.regex is None:
+                raise ValueError(
+                    "scorephrase cannot be combined with non-regex "
+                    "structured_outputs constraints."
+                )
+            elif self.structured_outputs.regex != scorephrase_regex:
+                raise ValueError(
+                    "scorephrase.allowed_levels generated regex "
+                    f"{scorephrase_regex!r}, but structured_outputs.regex is "
+                    f"{self.structured_outputs.regex!r}."
+                )
+
+        sand_fsm_state = build_config_c_fsm_state(self.sand_fsm)
+
+        extra_args: dict[str, Any] = dict(self.vllm_xargs) if self.vllm_xargs else {}
+        if scorephrase_state is not None:
+            extra_args["scorephrase_state"] = scorephrase_state
+        if sand_fsm_state is not None:
+            extra_args["sand_fsm_state"] = sand_fsm_state
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

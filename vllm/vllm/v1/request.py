@@ -120,6 +120,8 @@ class Request:
         self.profile_cache_reusable_tokens = _get_profile_cache_reusable_tokens(
             extra_args
         )
+        self.scorephrase_state = _get_extra_arg(extra_args, "scorephrase_state")
+        self.sand_fsm_state = _get_extra_arg(extra_args, "sand_fsm_state")
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -322,6 +324,12 @@ def _get_profile_cache_reusable_tokens(extra_args: dict[str, Any] | None) -> int
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
+
+
+def _get_extra_arg(extra_args: dict[str, Any] | None, key: str) -> Any | None:
+    if not extra_args:
+        return None
+    return extra_args.get(key)
 
 
 def _coerce_bool(value: Any) -> bool:
