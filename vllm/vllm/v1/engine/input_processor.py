@@ -4,6 +4,7 @@
 import os
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Literal, cast
 
 from vllm.config import VllmConfig
@@ -54,6 +55,43 @@ logger = init_logger(__name__)
 # Modalities that contribute to "visual" token count (image + video).
 # Used for logging text vs visual prompt token breakdown for VL models.
 _VISUAL_MODALITIES = ("image", "video")
+
+
+def _attach_sand_fsm_token_ids(
+    sampling_params: SamplingParams,
+    tokenizer: TokenizerLike | None,
+) -> None:
+    if tokenizer is None or not sampling_params.extra_args:
+        return
+
+    sand_fsm_state = sampling_params.extra_args.get("sand_fsm_state")
+    if not isinstance(sand_fsm_state, Mapping):
+        return
+
+    token_plan = sand_fsm_state.get("token_plan")
+    if not isinstance(token_plan, list):
+        return
+
+    encoded_state = deepcopy(dict(sand_fsm_state))
+    encoded_plan: list[Any] = []
+    for raw_segment in token_plan:
+        if not isinstance(raw_segment, Mapping):
+            encoded_plan.append(raw_segment)
+            continue
+        segment = dict(raw_segment)
+        kind = str(segment.get("kind") or "")
+        text = segment.get("text")
+        if kind != "model_span" and isinstance(text, str) and text:
+            segment["token_ids"] = tokenizer.encode(
+                text,
+                add_special_tokens=False,
+            )
+        encoded_plan.append(segment)
+
+    encoded_state["token_plan"] = encoded_plan
+    extra_args = dict(sampling_params.extra_args)
+    extra_args["sand_fsm_state"] = encoded_state
+    sampling_params.extra_args = extra_args
 
 
 def _get_prompt_token_length_breakdown(
@@ -607,6 +645,7 @@ class InputProcessor:
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
+            _attach_sand_fsm_token_ids(sampling_params, self.tokenizer)
         else:
             pooling_params = params.clone()
 

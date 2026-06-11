@@ -14,6 +14,7 @@ import torch
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
+from vllm.scorephrase import ConfigCTokenPlanRuntime, FsmSpanDraftState
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.v1.engine import (
     EngineCoreEvent,
@@ -122,6 +123,28 @@ class Request:
         )
         self.scorephrase_state = _get_extra_arg(extra_args, "scorephrase_state")
         self.sand_fsm_state = _get_extra_arg(extra_args, "sand_fsm_state")
+        self.sand_fsm_runtime = ConfigCTokenPlanRuntime.from_state(
+            self.sand_fsm_state
+        )
+        self.fsm_span_metrics: dict[str, Any] = {}
+        self.sand_fsm_force_known_spans = _get_sand_fsm_bool(
+            self.sand_fsm_state, "force_known_spans", False
+        )
+        self.sand_fsm_max_forced_tokens_per_step = _get_sand_fsm_int(
+            self.sand_fsm_state,
+            "max_forced_tokens_per_step",
+            default=64,
+            minimum=1,
+            maximum=512,
+        )
+        self.sand_fsm_force_runtime = (
+            FsmSpanDraftState.from_state(self.sand_fsm_state)
+            if self.sand_fsm_force_known_spans
+            else None
+        )
+        self.sand_fsm_force_disabled_reason = ""
+        self.sand_fsm_force_fallback_count = 0
+        self.pending_forced_output_token_ids: list[int] = []
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -218,6 +241,73 @@ class Request:
 
         if self.get_hash_new_full_blocks is not None:
             self.block_hashes.extend(self.get_hash_new_full_blocks())
+
+    def peek_sand_fsm_forced_token_ids(self, max_tokens: int) -> list[int]:
+        if (
+            not self.sand_fsm_force_known_spans
+            or self.sand_fsm_force_runtime is None
+            or self.sand_fsm_force_disabled_reason
+        ):
+            return []
+        return self.sand_fsm_force_runtime.peek_deterministic(max_tokens)
+
+    def commit_sand_fsm_forced_token_ids(self, token_ids: list[int]) -> list[int]:
+        if (
+            not token_ids
+            or not self.sand_fsm_force_known_spans
+            or self.sand_fsm_force_runtime is None
+            or self.sand_fsm_force_disabled_reason
+        ):
+            return []
+        committed = self.sand_fsm_force_runtime.commit_forced_token_ids(token_ids)
+        if not committed:
+            self.disable_sand_fsm_force("token_plan commit failed")
+            return []
+        self.append_output_token_ids(committed)
+        self.pending_forced_output_token_ids.extend(committed)
+        return committed
+
+    def take_pending_forced_output_token_ids(self) -> list[int]:
+        if not self.pending_forced_output_token_ids:
+            return []
+        token_ids = self.pending_forced_output_token_ids
+        self.pending_forced_output_token_ids = []
+        return token_ids
+
+    def disable_sand_fsm_force(self, reason: str) -> None:
+        if not self.sand_fsm_force_disabled_reason:
+            self.sand_fsm_force_fallback_count += 1
+        self.sand_fsm_force_disabled_reason = reason
+        self.pending_forced_output_token_ids.clear()
+
+    def sand_fsm_force_metrics(self) -> dict[str, Any]:
+        runtime_metrics = (
+            self.sand_fsm_force_runtime.metrics()
+            if self.sand_fsm_force_runtime is not None
+            else {}
+        )
+        forced_tokens = _get_int_from_mapping(runtime_metrics, "fsm_forced_tokens", 0)
+        kv_advance_tokens = _get_int_from_mapping(
+            runtime_metrics, "fsm_kv_advance_tokens", forced_tokens
+        )
+        force_fallback_count = (
+            self.sand_fsm_force_fallback_count
+            + _get_int_from_mapping(runtime_metrics, "fsm_force_fallback_count", 0)
+        )
+        if (
+            not self.sand_fsm_force_known_spans
+            and not forced_tokens
+            and not force_fallback_count
+        ):
+            return {}
+        return {
+            "fsm_force_known_spans": self.sand_fsm_force_known_spans,
+            "fsm_forced_tokens": forced_tokens,
+            "fsm_kv_advance_tokens": kv_advance_tokens,
+            "fsm_force_fallback_count": force_fallback_count,
+            "fsm_force_disabled_reason": self.sand_fsm_force_disabled_reason
+            or str(runtime_metrics.get("fsm_disabled_reason") or ""),
+        }
 
     @property
     def use_structured_output(self) -> bool:
@@ -330,6 +420,46 @@ def _get_extra_arg(extra_args: dict[str, Any] | None, key: str) -> Any | None:
     if not extra_args:
         return None
     return extra_args.get(key)
+
+
+def _get_sand_fsm_bool(
+    sand_fsm_state: Any | None,
+    key: str,
+    default: bool,
+) -> bool:
+    if not isinstance(sand_fsm_state, Mapping):
+        return default
+    if key not in sand_fsm_state:
+        return default
+    return _coerce_bool(sand_fsm_state.get(key))
+
+
+def _get_sand_fsm_int(
+    sand_fsm_state: Any | None,
+    key: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if not isinstance(sand_fsm_state, Mapping):
+        return default
+    try:
+        value = int(sand_fsm_state.get(key, default))
+    except (TypeError, ValueError):
+        return default
+    return min(max(value, minimum), maximum)
+
+
+def _get_int_from_mapping(
+    mapping: Mapping[str, Any],
+    key: str,
+    default: int,
+) -> int:
+    try:
+        return int(mapping.get(key, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _coerce_bool(value: Any) -> bool:

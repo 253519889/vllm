@@ -44,6 +44,7 @@ MTPModelTypes = Literal[
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
+    "fsm_span",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -290,6 +291,8 @@ class SpeculativeConfig:
                 self.model = "ngram"
             elif self.method == "suffix":
                 self.model = "suffix"
+            elif self.method == "fsm_span":
+                self.model = "fsm_span"
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -301,6 +304,8 @@ class SpeculativeConfig:
             self.model is not None and self.model in ("ngram", "[ngram]")
         ):
             self.method = "ngram"
+        if self.method is None and self.model == "fsm_span":
+            self.method = "fsm_span"
 
         if self.method in ("ngram", "[ngram]"):
             # Unified to "ngram" internally
@@ -339,6 +344,16 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "fsm_span":
+            if self.num_speculative_tokens is None:
+                raise ValueError(
+                    "num_speculative_tokens must be provided when using "
+                    "method='fsm_span'."
+                )
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
         else:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
@@ -704,6 +719,10 @@ class SpeculativeConfig:
 
     def __repr__(self) -> str:
         method = self.method
-        model = None if method in ("ngram", "suffix") else self.draft_model_config.model
+        model = (
+            None
+            if method in ("ngram", "suffix", "fsm_span")
+            else self.draft_model_config.model
+        )
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"

@@ -19,6 +19,7 @@ from vllm.outputs import (
     RequestOutput,
 )
 from vllm.sampling_params import RequestOutputKind
+from vllm.scorephrase import ConfigCTokenPlanRuntime
 from vllm.tokenizers import TokenizerLike
 from vllm.tracing import SpanAttributes, SpanKind, Tracer, extract_trace_context
 from vllm.utils import length_from_prompt_token_ids_or_embeds
@@ -135,6 +136,7 @@ class RequestState:
         prompt_embeds: torch.Tensor | None,
         logprobs_processor: LogprobsProcessor | None,
         detokenizer: IncrementalDetokenizer | None,
+        sand_fsm_runtime: ConfigCTokenPlanRuntime | None,
         max_tokens_param: int | None,
         arrival_time: float,
         queue: RequestOutputCollector | None,
@@ -160,6 +162,8 @@ class RequestState:
         )
         self.logprobs_processor = logprobs_processor
         self.detokenizer = detokenizer
+        self.sand_fsm_runtime = sand_fsm_runtime
+        self._sand_fsm_observed_text_offset = 0
         self.max_tokens_param = max_tokens_param
         self.top_p = top_p
         self.n = n
@@ -223,6 +227,8 @@ class RequestState:
                 tokenizer=tokenizer,
                 request=request,
             )
+            sand_fsm_state = (sampling_params.extra_args or {}).get("sand_fsm_state")
+            sand_fsm_runtime = ConfigCTokenPlanRuntime.from_state(sand_fsm_state)
             max_tokens_param = sampling_params.max_tokens
             top_p = sampling_params.top_p
             n = sampling_params.n
@@ -230,6 +236,7 @@ class RequestState:
         else:
             logprobs_processor = None
             detokenizer = None
+            sand_fsm_runtime = None
             max_tokens_param = None
             top_p = None
             n = None
@@ -250,6 +257,7 @@ class RequestState:
             prompt_embeds=request.prompt_embeds,
             logprobs_processor=logprobs_processor,
             detokenizer=detokenizer,
+            sand_fsm_runtime=sand_fsm_runtime,
             max_tokens_param=max_tokens_param,
             top_p=top_p,
             n=n,
@@ -260,6 +268,20 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
         )
+
+    def observe_sand_fsm_output(self) -> None:
+        if self.sand_fsm_runtime is None or self.detokenizer is None:
+            return
+        output_text = getattr(self.detokenizer, "output_text", None)
+        if output_text is None:
+            return
+        if len(output_text) < self._sand_fsm_observed_text_offset:
+            self.sand_fsm_runtime.disable("detokenizer output text rewound")
+            self._sand_fsm_observed_text_offset = len(output_text)
+            return
+        text_delta = output_text[self._sand_fsm_observed_text_offset :]
+        self._sand_fsm_observed_text_offset = len(output_text)
+        self.sand_fsm_runtime.observe_text(text_delta)
 
     def make_request_output(
         self,
@@ -635,6 +657,7 @@ class OutputProcessor:
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
+                req_state.observe_sand_fsm_output()
 
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.

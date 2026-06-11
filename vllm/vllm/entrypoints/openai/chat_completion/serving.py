@@ -554,11 +554,16 @@ class OpenAIServingChat(OpenAIServing):
         l2_cache = {}
         if final_res.kv_transfer_params:
             l2_cache = final_res.kv_transfer_params.get("l2_cache", {}) or {}
+        sand_fsm = {}
+        if final_res.kv_transfer_params:
+            sand_fsm = final_res.kv_transfer_params.get("sand_fsm", {}) or {}
         logger.info(
             "VLLM_TOKEN_TIMING request_id=%s ttft_ms=%.3f "
             "avg_output_token_ms=%.3f output_tokens=%d cached_tokens=%s "
             "l2_hit=%s l2_hit_tokens=%s cpu_to_gpu_transfer_ms=%.3f "
-            "source=%s",
+            "fsm_draft_tokens=%s fsm_accepted_tokens=%s "
+            "fsm_acceptance_rate=%.3f fsm_forced_tokens=%s "
+            "fsm_kv_advance_tokens=%s source=%s",
             request_id,
             ttft_ms,
             avg_output_token_ms,
@@ -567,6 +572,11 @@ class OpenAIServingChat(OpenAIServing):
             bool(l2_cache.get("l2_hit", False)),
             l2_cache.get("l2_hit_tokens", 0),
             float(l2_cache.get("cpu_to_gpu_transfer_ms", 0.0)),
+            sand_fsm.get("fsm_draft_tokens", 0),
+            sand_fsm.get("fsm_accepted_tokens", 0),
+            float(sand_fsm.get("fsm_acceptance_rate", 0.0)),
+            sand_fsm.get("fsm_forced_tokens", 0),
+            sand_fsm.get("fsm_kv_advance_tokens", 0),
             source,
         )
 

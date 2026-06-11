@@ -148,6 +148,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.fsm_span_proposer import FsmSpanProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -440,6 +441,7 @@ class GPUModelRunner(
         if self.speculative_config and get_pp_group().is_last_rank:
             self.drafter: (
                 NgramProposer
+                | FsmSpanProposer
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DraftModelProposer
@@ -447,6 +449,8 @@ class GPUModelRunner(
             )
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
+            elif self.speculative_config.method == "fsm_span":
+                self.drafter = FsmSpanProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -967,6 +971,7 @@ class GPUModelRunner(
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        scheduled_forced_tokens = scheduler_output.scheduled_forced_decode_tokens
 
         # Wait until valid_sampled_tokens_count is copied to cpu,
         # then use it to update actual num_computed_tokens of each request.
@@ -979,6 +984,7 @@ class GPUModelRunner(
             resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
+            forced_token_ids = scheduled_forced_tokens.get(req_id, [])
 
             if req_state.prev_num_draft_len and self.use_async_scheduling:
                 # prev_num_draft_len is used in async scheduling mode with
@@ -1022,6 +1028,8 @@ class GPUModelRunner(
                     req_state.output_token_ids.append(new_token_ids[-1])
                 elif num_new_tokens > 0:
                     req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
+            elif forced_token_ids:
+                req_state.output_token_ids.extend(forced_token_ids)
             elif num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure. Align the cached state.
@@ -1074,6 +1082,16 @@ class GPUModelRunner(
                 self.input_batch.token_ids_cpu[
                     req_index, start_token_index:end_token_index
                 ] = new_token_ids
+                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+            elif forced_token_ids:
+                end_token_index = req_state.num_tokens
+                start_token_index = end_token_index - len(forced_token_ids)
+                self.input_batch.token_ids_cpu[
+                    req_index, start_token_index:end_token_index
+                ] = forced_token_ids
+                self.input_batch.is_token_ids[
+                    req_index, start_token_index:end_token_index
+                ] = True
                 self.input_batch.num_tokens_no_spec[req_index] = end_token_index
 
             # Add spec_token_ids to token_ids_cpu.
@@ -3711,6 +3729,14 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            fsm_span_metrics = {}
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "fsm_span"
+                and isinstance(self.drafter, FsmSpanProposer)
+            ):
+                fsm_span_metrics = self.drafter.get_metrics()
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -3723,6 +3749,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                fsm_span_metrics=fsm_span_metrics,
             )
 
         if not self.use_async_scheduling:
@@ -3847,7 +3874,16 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        if spec_config.method == "ngram":
+        if spec_config.method == "fsm_span":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, FsmSpanProposer)
+            draft_token_ids = self.drafter.propose(
+                self.input_batch,
+                sampled_token_ids,
+                self.requests,
+                slot_mappings=slot_mappings,
+            )
+        elif spec_config.method == "ngram":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(

@@ -14,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 DEFAULT_VERSION = "config_c_fsm_v1"
 GENERATION_MODES = ("PROGRAM", "CHOICE", "SCORE", "PHRASE", "REVISION", "SPAN")
+TOKEN_PLAN_KINDS = ("fixed", "program", "choice", "score", "model_span")
 TOP_LEVEL_ORDER = (
     "视觉校验",
     "视觉特征",
@@ -197,6 +198,15 @@ def build_config_c_fsm_state(
         default=tuple(path for path in model_paths if path not in locked_paths),
         label="sand_fsm.pending_paths",
     )
+    token_plan = _normalize_token_plan(payload.get("token_plan"), field_map)
+    force_known_spans = _coerce_bool(payload.get("force_known_spans", False))
+    max_forced_tokens_per_step = _normalize_positive_int(
+        payload.get("max_forced_tokens_per_step", 64),
+        default=64,
+        minimum=1,
+        maximum=512,
+        label="sand_fsm.max_forced_tokens_per_step",
+    )
 
     return {
         "version": str(payload.get("version") or DEFAULT_VERSION),
@@ -209,6 +219,9 @@ def build_config_c_fsm_state(
         "jump_paths": list(jump_paths),
         "model_paths": list(model_paths),
         "pending_paths": list(pending_paths),
+        "token_plan": token_plan,
+        "force_known_spans": force_known_spans,
+        "max_forced_tokens_per_step": max_forced_tokens_per_step,
     }
 
 
@@ -316,6 +329,37 @@ def _normalize_score_fields(value: Any) -> dict[str, int]:
     return result
 
 
+def _coerce_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _normalize_positive_int(
+    value: Any,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+    label: str,
+) -> int:
+    if value is None:
+        return default
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an integer") from exc
+    if normalized < minimum:
+        return minimum
+    if normalized > maximum:
+        return maximum
+    return normalized
+
+
 def _normalize_paths(
     value: Any,
     field_map: Mapping[str, Mapping[str, Any]],
@@ -335,6 +379,67 @@ def _normalize_paths(
     return tuple(paths)
 
 
+def _normalize_token_plan(
+    value: Any,
+    field_map: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        raise ValueError("sand_fsm.token_plan must be a list")
+    result: list[dict[str, Any]] = []
+    for index, raw_segment in enumerate(value):
+        if not isinstance(raw_segment, Mapping):
+            raise ValueError("sand_fsm.token_plan items must be objects")
+        kind = str(raw_segment.get("kind") or "").strip()
+        if kind not in TOKEN_PLAN_KINDS:
+            raise ValueError(
+                f"sand_fsm.token_plan[{index}].kind must be one of "
+                f"{TOKEN_PLAN_KINDS}"
+            )
+
+        text = raw_segment.get("text", "")
+        if kind != "model_span" and (not isinstance(text, str) or text == ""):
+            raise ValueError(
+                f"sand_fsm.token_plan[{index}].text must be a non-empty string"
+            )
+        if kind == "model_span" and text and not isinstance(text, str):
+            raise ValueError(f"sand_fsm.token_plan[{index}].text must be a string")
+
+        json_path = str(raw_segment.get("json_path") or "").strip()
+        node: Mapping[str, Any] | None = None
+        if kind != "fixed" and not json_path:
+            raise ValueError(
+                f"sand_fsm.token_plan[{index}].json_path must not be empty"
+            )
+        if json_path:
+            node = _node_for_path(json_path, field_map)
+
+        mode = str(raw_segment.get("mode") or "").strip()
+        if not mode and node is not None:
+            mode = str(node.get("mode") or "")
+        if mode and mode not in GENERATION_MODES:
+            raise ValueError(
+                f"invalid sand_fsm token_plan mode for {json_path}: {mode}"
+            )
+
+        value_type = str(raw_segment.get("value_type") or "").strip()
+        if not value_type and node is not None:
+            value_type = str(node.get("value_type") or "")
+
+        segment: dict[str, Any] = {"kind": kind}
+        if text:
+            segment["text"] = text
+        if json_path:
+            segment["json_path"] = json_path
+        if mode:
+            segment["mode"] = mode
+        if value_type:
+            segment["value_type"] = value_type
+        result.append(segment)
+    return result
+
+
 def _node_for_path(
     json_path: str,
     field_map: Mapping[str, Mapping[str, Any]],
@@ -350,12 +455,9 @@ def _default_locked_paths(
     program_fields: Mapping[str, Any],
     has_scores: bool,
 ) -> tuple[str, ...]:
-    locked = {
-        node["json_path"]
-        for node in field_nodes
-        if node.get("locked") and (node["json_path"] != "mental_dims" or has_scores)
-    }
-    locked.update(program_fields)
+    locked = set(program_fields)
+    if has_scores:
+        locked.add("mental_dims")
     return tuple(node["json_path"] for node in field_nodes if node["json_path"] in locked)
 
 

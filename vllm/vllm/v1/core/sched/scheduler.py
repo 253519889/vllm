@@ -310,6 +310,104 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    def _get_sand_fsm_forced_tokens_to_schedule(
+        self,
+        request: Request,
+        *,
+        base_num_new_tokens: int,
+        token_budget: int,
+    ) -> list[int]:
+        """Return deterministic output tokens to compute as KV-only advance.
+
+        This conservative path only runs during decode, after the prompt has
+        been fully computed. It does not mix with speculative decoding,
+        pipeline parallel token handoff, async placeholders, or logprobs.
+        """
+        if (
+            not request.sand_fsm_force_known_spans
+            or request.sand_fsm_force_runtime is None
+            or request.sand_fsm_force_disabled_reason
+            or base_num_new_tokens <= 0
+            or self.use_pp
+            or self.need_mamba_block_aligned_split
+            or self.scheduler_config.async_scheduling
+            or request.spec_token_ids
+            or request.num_output_placeholders > 0
+            or request.sampling_params is None
+        ):
+            return []
+        if (
+            request.sampling_params.logprobs is not None
+            or request.sampling_params.prompt_logprobs is not None
+        ):
+            return []
+        if request.num_computed_tokens < request.num_prompt_tokens:
+            return []
+
+        extra_budget = token_budget - base_num_new_tokens
+        remaining_output_tokens = request.max_tokens - request.num_output_tokens - 1
+        model_room = (
+            self.max_model_len
+            - 1
+            - request.num_computed_tokens
+            - base_num_new_tokens
+        )
+        max_force_tokens = min(
+            extra_budget,
+            remaining_output_tokens,
+            model_room,
+            request.sand_fsm_max_forced_tokens_per_step,
+        )
+        if max_force_tokens <= 0:
+            return []
+
+        forced_token_ids = request.peek_sand_fsm_forced_token_ids(max_force_tokens)
+        if not forced_token_ids:
+            return []
+        return self._validate_sand_fsm_forced_tokens(request, forced_token_ids)
+
+    def _validate_sand_fsm_forced_tokens(
+        self, request: Request, token_ids: list[int]
+    ) -> list[int]:
+        if not token_ids or not request.use_structured_output:
+            return token_ids
+        if not self.structured_output_manager.should_advance(request):
+            return []
+
+        structured_req = request.structured_output_request
+        assert structured_req is not None
+        assert structured_req.grammar is not None
+        accepted = structured_req.grammar.validate_tokens(token_ids)
+        if len(accepted) != len(token_ids):
+            request.disable_sand_fsm_force(
+                "schema rejected forced deterministic token"
+            )
+            return []
+        return token_ids
+
+    def _commit_sand_fsm_forced_tokens(
+        self, request: Request, token_ids: list[int]
+    ) -> list[int]:
+        if not token_ids:
+            return []
+
+        committed = request.commit_sand_fsm_forced_token_ids(token_ids)
+        if not committed:
+            return []
+
+        if request.use_structured_output and self.structured_output_manager.should_advance(
+            request
+        ):
+            structured_req = request.structured_output_request
+            assert structured_req is not None
+            assert structured_req.grammar is not None
+            ok = structured_req.grammar.accept_tokens(request.request_id, committed)
+            if not ok:
+                request.disable_sand_fsm_force(
+                    "schema failed to accept forced deterministic token"
+                )
+        return committed
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -335,6 +433,8 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        # Sand-FSM deterministic token KV-advance.
+        scheduled_forced_decode_tokens: dict[str, list[int]] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -405,6 +505,14 @@ class Scheduler(SchedulerInterface):
                     request, num_new_tokens
                 )
 
+            forced_token_ids = self._get_sand_fsm_forced_tokens_to_schedule(
+                request,
+                base_num_new_tokens=num_new_tokens,
+                token_budget=token_budget,
+            )
+            if forced_token_ids:
+                num_new_tokens += len(forced_token_ids)
+
             if num_new_tokens == 0:
                 # The request cannot be scheduled because one of the following
                 # reasons:
@@ -454,6 +562,9 @@ class Scheduler(SchedulerInterface):
                             scheduled_spec_decode_tokens.pop(
                                 preempted_req.request_id, None
                             )
+                            scheduled_forced_decode_tokens.pop(
+                                preempted_req.request_id, None
+                            )
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req.request_id, None
                             )
@@ -483,6 +594,8 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             req_to_new_blocks[request.request_id] = new_blocks
             num_scheduled_tokens[request.request_id] = num_new_tokens
+            if forced_token_ids:
+                scheduled_forced_decode_tokens[request.request_id] = forced_token_ids
             token_budget -= num_new_tokens
             req_index += 1
 
@@ -793,6 +906,18 @@ class Scheduler(SchedulerInterface):
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
 
+        for request in scheduled_running_reqs:
+            forced_token_ids = scheduled_forced_decode_tokens.get(request.request_id)
+            if forced_token_ids:
+                committed = self._commit_sand_fsm_forced_tokens(
+                    request, forced_token_ids
+                )
+                if committed != forced_token_ids:
+                    logger.warning(
+                        "Sand-FSM force token commit mismatch for request %s.",
+                        request.request_id,
+                    )
+
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
@@ -857,6 +982,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_forced_decode_tokens=scheduled_forced_decode_tokens,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
@@ -1275,11 +1401,15 @@ class Scheduler(SchedulerInterface):
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism).
                 continue
+            fsm_span_metrics = model_runner_output.fsm_span_metrics.get(req_id)
+            if fsm_span_metrics:
+                request.fsm_span_metrics = dict(fsm_span_metrics)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
                 sampled_token_ids[req_index] if sampled_token_ids else []
             )
+            forced_token_ids = request.take_pending_forced_output_token_ids()
 
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
@@ -1323,6 +1453,7 @@ class Scheduler(SchedulerInterface):
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
+            output_token_ids = forced_token_ids + new_token_ids
 
             routed_experts = None
             finish_reason = None
@@ -1367,7 +1498,7 @@ class Scheduler(SchedulerInterface):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if (
-                new_token_ids
+                output_token_ids
                 or pooler_output is not None
                 or kv_transfer_params
                 or stopped
@@ -1376,7 +1507,7 @@ class Scheduler(SchedulerInterface):
                 outputs[request.client_index].append(
                     EngineCoreOutput(
                         request_id=req_id,
-                        new_token_ids=new_token_ids,
+                        new_token_ids=output_token_ids,
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
@@ -1687,6 +1818,11 @@ class Scheduler(SchedulerInterface):
         if request.kv_transfer_metrics:
             kv_xfer_params = dict(kv_xfer_params or {})
             kv_xfer_params["l2_cache"] = dict(request.kv_transfer_metrics)
+        sand_fsm_metrics = dict(request.fsm_span_metrics)
+        sand_fsm_metrics.update(request.sand_fsm_force_metrics())
+        if sand_fsm_metrics:
+            kv_xfer_params = dict(kv_xfer_params or {})
+            kv_xfer_params["sand_fsm"] = sand_fsm_metrics
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)

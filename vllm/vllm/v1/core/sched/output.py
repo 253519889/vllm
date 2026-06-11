@@ -201,6 +201,9 @@ class SchedulerOutput:
     # If a request does not have any spec decode tokens, it will not be
     # included in the dictionary.
     scheduled_spec_decode_tokens: dict[str, list[int]]
+    # req_id -> forced deterministic token_ids that are committed as output
+    # and scheduled only to advance KV cache, without sampler verification.
+    scheduled_forced_decode_tokens: dict[str, list[int]]
     # req_id -> encoder input indices that need processing.
     # E.g., if a request has [0, 1], it could mean the vision encoder needs
     # to process that the request's 0-th and 1-th images in the current step.
@@ -246,6 +249,7 @@ class SchedulerOutput:
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens={},
+            scheduled_forced_decode_tokens={},
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),
