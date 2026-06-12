@@ -328,18 +328,25 @@ class Scheduler(SchedulerInterface):
             or request.sand_fsm_force_runtime is None
             or request.sand_fsm_force_disabled_reason
             or base_num_new_tokens <= 0
-            or self.use_pp
-            or self.need_mamba_block_aligned_split
-            or self.scheduler_config.async_scheduling
             or request.spec_token_ids
             or request.num_output_placeholders > 0
             or request.sampling_params is None
         ):
             return []
+        if self.use_pp:
+            request.disable_sand_fsm_force("pipeline parallelism is not supported")
+            return []
+        if self.need_mamba_block_aligned_split:
+            request.disable_sand_fsm_force("mamba block-aligned scheduling is not supported")
+            return []
+        if self.scheduler_config.async_scheduling:
+            request.disable_sand_fsm_force("async scheduling is not supported")
+            return []
         if (
             request.sampling_params.logprobs is not None
             or request.sampling_params.prompt_logprobs is not None
         ):
+            request.disable_sand_fsm_force("logprobs are not supported")
             return []
         if request.num_computed_tokens < request.num_prompt_tokens:
             return []
@@ -1449,6 +1456,7 @@ class Scheduler(SchedulerInterface):
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
+                request.observe_sand_fsm_model_token_ids(new_token_ids)
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

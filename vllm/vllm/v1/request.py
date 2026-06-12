@@ -280,6 +280,16 @@ class Request:
         self.sand_fsm_force_disabled_reason = reason
         self.pending_forced_output_token_ids.clear()
 
+    def observe_sand_fsm_model_token_ids(self, token_ids: list[int]) -> None:
+        if (
+            not token_ids
+            or not self.sand_fsm_force_known_spans
+            or self.sand_fsm_force_runtime is None
+            or self.sand_fsm_force_disabled_reason
+        ):
+            return
+        self.sand_fsm_force_runtime.observe_token_ids(token_ids)
+
     def sand_fsm_force_metrics(self) -> dict[str, Any]:
         runtime_metrics = (
             self.sand_fsm_force_runtime.metrics()
@@ -293,6 +303,7 @@ class Request:
         force_fallback_count = (
             self.sand_fsm_force_fallback_count
             + _get_int_from_mapping(runtime_metrics, "fsm_force_fallback_count", 0)
+            + _get_int_from_mapping(runtime_metrics, "fsm_fallback_count", 0)
         )
         if (
             not self.sand_fsm_force_known_spans

@@ -563,7 +563,8 @@ class OpenAIServingChat(OpenAIServing):
             "l2_hit=%s l2_hit_tokens=%s cpu_to_gpu_transfer_ms=%.3f "
             "fsm_draft_tokens=%s fsm_accepted_tokens=%s "
             "fsm_acceptance_rate=%.3f fsm_forced_tokens=%s "
-            "fsm_kv_advance_tokens=%s source=%s",
+            "fsm_kv_advance_tokens=%s fsm_force_fallback_count=%s "
+            "fsm_force_disabled_reason=%s source=%s",
             request_id,
             ttft_ms,
             avg_output_token_ms,
@@ -577,6 +578,8 @@ class OpenAIServingChat(OpenAIServing):
             float(sand_fsm.get("fsm_acceptance_rate", 0.0)),
             sand_fsm.get("fsm_forced_tokens", 0),
             sand_fsm.get("fsm_kv_advance_tokens", 0),
+            sand_fsm.get("fsm_force_fallback_count", 0),
+            sand_fsm.get("fsm_force_disabled_reason", ""),
             source,
         )
 
