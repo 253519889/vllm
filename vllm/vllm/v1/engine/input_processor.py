@@ -74,6 +74,22 @@ def _attach_sand_fsm_token_ids(
 
     encoded_state = deepcopy(dict(sand_fsm_state))
     encoded_plan: list[Any] = []
+    force_plan: list[dict[str, Any]] = []
+    deterministic_text_parts: list[str] = []
+
+    def flush_force_deterministic() -> None:
+        if not deterministic_text_parts:
+            return
+        text = "".join(deterministic_text_parts)
+        force_plan.append(
+            {
+                "kind": "fixed",
+                "text": text,
+                "token_ids": tokenizer.encode(text, add_special_tokens=False),
+            }
+        )
+        deterministic_text_parts.clear()
+
     for raw_segment in token_plan:
         if not isinstance(raw_segment, Mapping):
             encoded_plan.append(raw_segment)
@@ -81,14 +97,25 @@ def _attach_sand_fsm_token_ids(
         segment = dict(raw_segment)
         kind = str(segment.get("kind") or "")
         text = segment.get("text")
-        if kind != "model_span" and isinstance(text, str) and text:
+        if kind == "model_span":
+            flush_force_deterministic()
+            force_segment = {"kind": kind}
+            for key in ("json_path", "mode", "value_type"):
+                value = segment.get(key)
+                if value:
+                    force_segment[key] = value
+            force_plan.append(force_segment)
+        elif isinstance(text, str) and text:
             segment["token_ids"] = tokenizer.encode(
                 text,
                 add_special_tokens=False,
             )
+            deterministic_text_parts.append(text)
         encoded_plan.append(segment)
+    flush_force_deterministic()
 
     encoded_state["token_plan"] = encoded_plan
+    encoded_state["force_token_plan"] = force_plan
     extra_args = dict(sampling_params.extra_args)
     extra_args["sand_fsm_state"] = encoded_state
     sampling_params.extra_args = extra_args

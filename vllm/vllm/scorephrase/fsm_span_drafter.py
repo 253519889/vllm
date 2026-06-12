@@ -50,7 +50,9 @@ class FsmSpanDraftState:
     def from_state(cls, state: Mapping[str, Any] | None) -> "FsmSpanDraftState | None":
         if not isinstance(state, Mapping):
             return None
-        return cls.from_token_plan(state.get("token_plan"))
+        return cls.from_token_plan(
+            state.get("force_token_plan") or state.get("token_plan")
+        )
 
     @classmethod
     def from_token_plan(cls, token_plan: Any) -> "FsmSpanDraftState | None":
