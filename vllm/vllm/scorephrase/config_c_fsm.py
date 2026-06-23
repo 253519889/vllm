@@ -136,6 +136,13 @@ DEFAULT_FIELD_NODES = (
         "source": "score_cards",
     },
     {
+        "json_path": "综合评估.心理状态概述",
+        "mode": "PHRASE",
+        "value_type": "str",
+        "fallback_modes": ["SPAN", "REVISION"],
+        "source": "summary_phrase_db",
+    },
+    {
         "json_path": "mental_dims",
         "mode": "SCORE",
         "value_type": "object[int]",
