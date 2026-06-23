@@ -148,6 +148,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.evidence_phrase_proposer import EvidencePhraseProposer
 from vllm.v1.spec_decode.fsm_span_proposer import FsmSpanProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -442,6 +443,7 @@ class GPUModelRunner(
             self.drafter: (
                 NgramProposer
                 | FsmSpanProposer
+                | EvidencePhraseProposer
                 | SuffixDecodingProposer
                 | EagleProposer
                 | DraftModelProposer
@@ -451,6 +453,8 @@ class GPUModelRunner(
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "fsm_span":
                 self.drafter = FsmSpanProposer(self.vllm_config)
+            elif self.speculative_config.method == "evidence_phrase":
+                self.drafter = EvidencePhraseProposer(self.vllm_config)
             elif self.speculative_config.uses_draft_model():
                 self.drafter = DraftModelProposer(
                     vllm_config=self.vllm_config,
@@ -3730,12 +3734,19 @@ class GPUModelRunner(
                     logger.error("RoutedExpertsCapturer not initialized.")
 
             fsm_span_metrics = {}
+            evidence_phrase_metrics = {}
             if (
                 self.speculative_config
                 and self.speculative_config.method == "fsm_span"
                 and isinstance(self.drafter, FsmSpanProposer)
             ):
                 fsm_span_metrics = self.drafter.get_metrics()
+            if (
+                self.speculative_config
+                and self.speculative_config.method == "evidence_phrase"
+                and isinstance(self.drafter, EvidencePhraseProposer)
+            ):
+                evidence_phrase_metrics = self.drafter.get_metrics()
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -3750,6 +3761,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 fsm_span_metrics=fsm_span_metrics,
+                evidence_phrase_metrics=evidence_phrase_metrics,
             )
 
         if not self.use_async_scheduling:
@@ -3877,6 +3889,15 @@ class GPUModelRunner(
         if spec_config.method == "fsm_span":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, FsmSpanProposer)
+            draft_token_ids = self.drafter.propose(
+                self.input_batch,
+                sampled_token_ids,
+                self.requests,
+                slot_mappings=slot_mappings,
+            )
+        elif spec_config.method == "evidence_phrase":
+            assert isinstance(sampled_token_ids, list)
+            assert isinstance(self.drafter, EvidencePhraseProposer)
             draft_token_ids = self.drafter.propose(
                 self.input_batch,
                 sampled_token_ids,

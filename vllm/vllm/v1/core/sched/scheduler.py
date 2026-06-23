@@ -1411,6 +1411,11 @@ class Scheduler(SchedulerInterface):
             fsm_span_metrics = model_runner_output.fsm_span_metrics.get(req_id)
             if fsm_span_metrics:
                 request.fsm_span_metrics = dict(fsm_span_metrics)
+            evidence_phrase_metrics = model_runner_output.evidence_phrase_metrics.get(
+                req_id
+            )
+            if evidence_phrase_metrics:
+                request.evidence_phrase_metrics = dict(evidence_phrase_metrics)
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -1831,6 +1836,9 @@ class Scheduler(SchedulerInterface):
         if sand_fsm_metrics:
             kv_xfer_params = dict(kv_xfer_params or {})
             kv_xfer_params["sand_fsm"] = sand_fsm_metrics
+        if request.evidence_phrase_metrics:
+            kv_xfer_params = dict(kv_xfer_params or {})
+            kv_xfer_params["evidence_phrase"] = dict(request.evidence_phrase_metrics)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
         self.finished_req_ids.add(request_id)

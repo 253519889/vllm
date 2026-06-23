@@ -557,6 +557,11 @@ class OpenAIServingChat(OpenAIServing):
         sand_fsm = {}
         if final_res.kv_transfer_params:
             sand_fsm = final_res.kv_transfer_params.get("sand_fsm", {}) or {}
+        evidence_phrase = {}
+        if final_res.kv_transfer_params:
+            evidence_phrase = (
+                final_res.kv_transfer_params.get("evidence_phrase", {}) or {}
+            )
         logger.info(
             "VLLM_TOKEN_TIMING request_id=%s ttft_ms=%.3f "
             "avg_output_token_ms=%.3f output_tokens=%d cached_tokens=%s "
@@ -564,7 +569,11 @@ class OpenAIServingChat(OpenAIServing):
             "fsm_draft_tokens=%s fsm_accepted_tokens=%s "
             "fsm_acceptance_rate=%.3f fsm_forced_tokens=%s "
             "fsm_kv_advance_tokens=%s fsm_force_fallback_count=%s "
-            "fsm_force_disabled_reason=%s source=%s",
+            "fsm_force_disabled_reason=%s "
+            "evidence_phrase_proposed_tokens=%s "
+            "evidence_phrase_accepted_tokens=%s "
+            "evidence_phrase_acceptance_rate=%.3f "
+            "evidence_phrase_zero_accept_count=%s source=%s",
             request_id,
             ttft_ms,
             avg_output_token_ms,
@@ -580,6 +589,10 @@ class OpenAIServingChat(OpenAIServing):
             sand_fsm.get("fsm_kv_advance_tokens", 0),
             sand_fsm.get("fsm_force_fallback_count", 0),
             sand_fsm.get("fsm_force_disabled_reason", ""),
+            evidence_phrase.get("evidence_phrase_proposed_tokens", 0),
+            evidence_phrase.get("evidence_phrase_accepted_tokens", 0),
+            float(evidence_phrase.get("evidence_phrase_acceptance_rate", 0.0)),
+            evidence_phrase.get("evidence_phrase_zero_accept_count", 0),
             source,
         )
 

@@ -42,7 +42,11 @@ from vllm.sampling_params import (
     SamplingParams,
     StructuredOutputsParams,
 )
-from vllm.scorephrase import build_config_c_fsm_state, build_scorephrase_score_space
+from vllm.scorephrase import (
+    build_config_c_fsm_state,
+    build_evidence_phrase_state,
+    build_scorephrase_score_space,
+)
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
@@ -371,6 +375,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "online field jump and proposer stages."
         ),
     )
+    evidence_phrase: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "EvidencePhrase request-local state for phrase speculative "
+            "drafting. The phrase DB remains server-side; this payload carries "
+            "sample score/evidence conditions and enabled JSON paths."
+        ),
+    )
 
     # --8<-- [end:chat-completion-extra-params]
 
@@ -486,12 +498,20 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 )
 
         sand_fsm_state = build_config_c_fsm_state(self.sand_fsm)
+        evidence_phrase_state = build_evidence_phrase_state(self.evidence_phrase)
 
         extra_args: dict[str, Any] = dict(self.vllm_xargs) if self.vllm_xargs else {}
         if scorephrase_state is not None:
             extra_args["scorephrase_state"] = scorephrase_state
         if sand_fsm_state is not None:
             extra_args["sand_fsm_state"] = sand_fsm_state
+        if evidence_phrase_state is not None:
+            extra_args["evidence_phrase_state"] = evidence_phrase_state
+        elif (
+            isinstance(self.evidence_phrase, dict)
+            and self.evidence_phrase.get("enabled") is False
+        ):
+            extra_args["evidence_phrase_state"] = {"enabled": False}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params

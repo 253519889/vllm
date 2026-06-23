@@ -192,6 +192,9 @@ class ModelRunnerOutput:
     # req_id -> request-local Config C fsm_span speculative metrics.
     fsm_span_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    # req_id -> request-local EvidencePhrase speculative metrics.
+    evidence_phrase_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
+
 
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):

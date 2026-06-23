@@ -45,6 +45,7 @@ EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
     "fsm_span",
+    "evidence_phrase",
     "medusa",
     "mlp_speculator",
     "draft_model",
@@ -152,6 +153,9 @@ class SpeculativeConfig:
     """The minimum token probability for suffix decoding. Will only speculate
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
+
+    evidence_phrase_config: dict[str, Any] | None = None
+    """Default server-side EvidencePhrase config for method='evidence_phrase'."""
 
     def compute_hash(self) -> str:
         """
@@ -293,6 +297,8 @@ class SpeculativeConfig:
                 self.model = "suffix"
             elif self.method == "fsm_span":
                 self.model = "fsm_span"
+            elif self.method == "evidence_phrase":
+                self.model = "evidence_phrase"
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -306,6 +312,8 @@ class SpeculativeConfig:
             self.method = "ngram"
         if self.method is None and self.model == "fsm_span":
             self.method = "fsm_span"
+        if self.method is None and self.model == "evidence_phrase":
+            self.method = "evidence_phrase"
 
         if self.method in ("ngram", "[ngram]"):
             # Unified to "ngram" internally
@@ -349,6 +357,16 @@ class SpeculativeConfig:
                 raise ValueError(
                     "num_speculative_tokens must be provided when using "
                     "method='fsm_span'."
+                )
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "evidence_phrase":
+            if self.num_speculative_tokens is None:
+                raise ValueError(
+                    "num_speculative_tokens must be provided when using "
+                    "method='evidence_phrase'."
                 )
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
@@ -721,7 +739,7 @@ class SpeculativeConfig:
         method = self.method
         model = (
             None
-            if method in ("ngram", "suffix", "fsm_span")
+            if method in ("ngram", "suffix", "fsm_span", "evidence_phrase")
             else self.draft_model_config.model
         )
         num_spec_tokens = self.num_speculative_tokens

@@ -123,10 +123,14 @@ class Request:
         )
         self.scorephrase_state = _get_extra_arg(extra_args, "scorephrase_state")
         self.sand_fsm_state = _get_extra_arg(extra_args, "sand_fsm_state")
+        self.evidence_phrase_state = _get_extra_arg(
+            extra_args, "evidence_phrase_state"
+        )
         self.sand_fsm_runtime = ConfigCTokenPlanRuntime.from_state(
             self.sand_fsm_state
         )
         self.fsm_span_metrics: dict[str, Any] = {}
+        self.evidence_phrase_metrics: dict[str, Any] = {}
         self.sand_fsm_force_known_spans = _get_sand_fsm_bool(
             self.sand_fsm_state, "force_known_spans", False
         )
