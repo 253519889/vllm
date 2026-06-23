@@ -39,6 +39,7 @@ class EvidencePhraseRuntime:
     state: Mapping[str, Any]
     tracker: FsmSpanDraftState
     max_spec_tokens: int
+    observed_output_len: int = 0
     used_phrase_ids: set[str] = field(default_factory=set)
     pending: PendingDraft | None = None
     stage_index: int = 0
@@ -211,7 +212,9 @@ class EvidencePhraseProposer:
                 draft_token_ids.append([])
                 continue
 
+            self._observe_request_output(runtime, request)
             runtime.observe(sampled_ids)
+            runtime.observed_output_len += len(sampled_ids)
             num_tokens = input_batch.num_tokens_no_spec[i]
             if num_tokens >= self.max_model_len:
                 draft_token_ids.append([])
@@ -260,6 +263,20 @@ class EvidencePhraseProposer:
         )
         self.runtimes[req_id] = runtime
         return runtime
+
+    def _observe_request_output(
+        self,
+        runtime: EvidencePhraseRuntime,
+        request: "CachedRequestState",
+    ) -> None:
+        output_token_ids = request.output_token_ids
+        if runtime.observed_output_len > len(output_token_ids):
+            runtime.observed_output_len = len(output_token_ids)
+        if runtime.observed_output_len == len(output_token_ids):
+            return
+        new_token_ids = output_token_ids[runtime.observed_output_len :]
+        runtime.observe(new_token_ids)
+        runtime.observed_output_len = len(output_token_ids)
 
     def _propose_one(
         self, runtime: EvidencePhraseRuntime, remaining_model_tokens: int
@@ -337,4 +354,3 @@ class EvidencePhraseProposer:
 
 def _is_model_span(segment: FsmSpanDraftSegment) -> bool:
     return segment.kind == "model_span"
-
