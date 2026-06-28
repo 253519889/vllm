@@ -489,6 +489,7 @@ class EngineArgs:
     ray_workers_use_nsight: bool = ParallelConfig.ray_workers_use_nsight
     num_gpu_blocks_override: int | None = CacheConfig.num_gpu_blocks_override
     model_loader_extra_config: dict = get_field(LoadConfig, "model_loader_extra_config")
+    epq_fake_quant_config: dict[str, Any] | str | None = None
     ignore_patterns: str | list[str] = get_field(LoadConfig, "ignore_patterns")
 
     enable_chunked_prefill: bool | None = None
@@ -725,6 +726,20 @@ class EngineArgs:
         )
         load_group.add_argument(
             "--model-loader-extra-config", **load_kwargs["model_loader_extra_config"]
+        )
+        load_group.add_argument(
+            "--epq-fake-quant-config",
+            type=union_dict_and_str,
+            default=None,
+            help=(
+                "Evidence-preserving quantization sensitivity hook. "
+                "Applies startup-only fake quantization to selected loaded "
+                "floating-point weight tensors. Accepts JSON such as "
+                '\'{"patterns":["layers.24."],"precision":"fp8","group_size":128}\' '
+                "or a compact string like "
+                "'layers.24.:int4,layers.25.:fp8,lm_head:fp16'. "
+                "This does not install real quantized kernels."
+            ),
         )
         load_group.add_argument("--ignore-patterns", **load_kwargs["ignore_patterns"])
         load_group.add_argument("--use-tqdm-on-load", **load_kwargs["use_tqdm_on_load"])
@@ -1292,6 +1307,12 @@ class EngineArgs:
     def create_load_config(self) -> LoadConfig:
         if self.quantization == "bitsandbytes":
             self.load_format = "bitsandbytes"
+
+        if self.epq_fake_quant_config is not None:
+            self.model_loader_extra_config = dict(self.model_loader_extra_config or {})
+            self.model_loader_extra_config["epq_fake_quant"] = (
+                self.epq_fake_quant_config
+            )
 
         if self.load_format == "tensorizer":
             if hasattr(self.model_loader_extra_config, "to_serializable"):

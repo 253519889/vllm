@@ -9,6 +9,9 @@ import vllm.envs as envs
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.model_executor.model_loader.epq_fake_quant import (
+    apply_epq_fake_quant_from_config,
+)
 from vllm.model_executor.model_loader.utils import (
     initialize_model,
     process_weights_after_loading,
@@ -57,6 +60,12 @@ class BaseModelLoader(ABC):
             # Quantization does not happen in `load_weights` but after it
             self.load_weights(model, model_config)
             process_weights_after_loading(model, model_config, target_device)
+            extra_config = self.load_config.model_loader_extra_config
+            if isinstance(extra_config, dict) and extra_config.get("epq_fake_quant"):
+                apply_epq_fake_quant_from_config(
+                    model,
+                    extra_config["epq_fake_quant"],
+                )
 
         return model.eval()
 
