@@ -111,6 +111,15 @@ def apply_epq_fake_quant_from_config(
         stats.kept_params,
         stats.quantized_elements,
     )
+    logger.info(
+        "EPQ_FAKE_QUANT_SUMMARY matched=%d quantized=%d skipped=%d kept=%d "
+        "elements=%d",
+        stats.matched_params,
+        stats.quantized_params,
+        stats.skipped_params,
+        stats.kept_params,
+        stats.quantized_elements,
+    )
     return stats
 
 

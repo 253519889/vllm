@@ -1309,6 +1309,10 @@ class EngineArgs:
             self.load_format = "bitsandbytes"
 
         if self.epq_fake_quant_config is not None:
+            logger.info(
+                "EPQ_FAKE_QUANT_CONFIG_RECEIVED config=%s",
+                self.epq_fake_quant_config,
+            )
             self.model_loader_extra_config = dict(self.model_loader_extra_config or {})
             self.model_loader_extra_config["epq_fake_quant"] = (
                 self.epq_fake_quant_config

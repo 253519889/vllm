@@ -62,10 +62,31 @@ class BaseModelLoader(ABC):
             process_weights_after_loading(model, model_config, target_device)
             extra_config = self.load_config.model_loader_extra_config
             if isinstance(extra_config, dict) and extra_config.get("epq_fake_quant"):
-                apply_epq_fake_quant_from_config(
+                logger.info(
+                    "EPQ_FAKE_QUANT_APPLY_START config=%s",
+                    extra_config["epq_fake_quant"],
+                )
+                stats = apply_epq_fake_quant_from_config(
                     model,
                     extra_config["epq_fake_quant"],
                 )
+                logger.info(
+                    "EPQ_FAKE_QUANT_LOADER_SUMMARY matched=%d quantized=%d "
+                    "skipped=%d kept=%d elements=%d",
+                    stats.matched_params,
+                    stats.quantized_params,
+                    stats.skipped_params,
+                    stats.kept_params,
+                    stats.quantized_elements,
+                )
+                if stats.quantized_params <= 0:
+                    logger.warning(
+                        "EPQ_FAKE_QUANT_NO_QUANTIZED_PARAMS matched=%d skipped=%d "
+                        "kept=%d. Check --epq-fake-quant-config patterns.",
+                        stats.matched_params,
+                        stats.skipped_params,
+                        stats.kept_params,
+                    )
 
         return model.eval()
 
